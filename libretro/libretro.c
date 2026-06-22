@@ -3740,33 +3740,34 @@ static void autoload_rom_basename(char *out, size_t out_size)
    if (dot) *dot = '\0';
 }
 
-static bool autoload_extract_rastate(const unsigned char *file, size_t file_len,
-                                     const unsigned char **out_data, size_t *out_size)
+/* RetroArch wraps states in a "RASTATE" container; the real data is in the
+ * "MEM " block. Returns true (and points at the MEM block) if it's a
+ * container, false to treat the file as a raw state. */
+static bool autoload_extract_rastate(const uint8_t *file, size_t file_len,
+                                     const uint8_t **out_data, size_t *out_size)
 {
-   const char *p    = (const char *)file;
-   const char *end  = p + file_len;
-   size_t      blocksize = 0;
-
-   if (file_len < 7 || memcmp(p, "RASTATE", 7) != 0)
+   size_t pos;
+   if (file_len < 8 || memcmp(file, "RASTATE", 7) != 0)
       return false;
-
-   p += 7;
-   while (p + 8 <= end)
+   pos = 8;
+   while (pos + 8 <= file_len)
    {
-      if (memcmp(p, "END ", 4) == 0)
-         break;
-      blocksize = ((size_t)(unsigned char)p[4] << 24) |
-                  ((size_t)(unsigned char)p[5] << 16) |
-                  ((size_t)(unsigned char)p[6] <<  8) |
-                  ((size_t)(unsigned char)p[7]);
-      p += 8;
-      if (memcmp(p - 8, "MEM ", 4) == 0)
+      const uint8_t *p = file + pos;
+      uint32_t blocksize =  (uint32_t)p[4]
+                         | ((uint32_t)p[5] << 8)
+                         | ((uint32_t)p[6] << 16)
+                         | ((uint32_t)p[7] << 24);
+      pos += 8;
+      if (memcmp(p, "MEM ", 4) == 0)
       {
-         *out_data = (const unsigned char *)p;
-         *out_size = blocksize;
+         if (pos + blocksize > file_len) return false;
+         *out_data = file + pos;
+         *out_size = (size_t)blocksize;
          return true;
       }
-      p += blocksize;
+      if (memcmp(p, "END ", 4) == 0)
+         break;
+      pos += blocksize;
    }
    return false;
 }
@@ -3780,7 +3781,7 @@ static void autoload_try_load_state(void)
    void           *buf        = NULL;
    size_t          len        = 0;
    size_t          expected   = retro_serialize_size();
-   const unsigned char *state_data = NULL;
+   const uint8_t  *state_data = NULL;
    size_t          state_size = 0;
    size_t          plen;
 
@@ -3893,7 +3894,7 @@ static void autoload_try_load_state(void)
 
    if (buf && len > 0)
    {
-      if (autoload_extract_rastate((const unsigned char*)buf, len,
+      if (autoload_extract_rastate((const uint8_t*)buf, (size_t)len,
                                    &state_data, &state_size))
          autoload_logf("RASTATE       : container detected, MEM block = %u bytes",
                        (unsigned)state_size);
