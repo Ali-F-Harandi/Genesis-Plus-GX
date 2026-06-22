@@ -3410,6 +3410,839 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code)
 	apply_cheats();
 }
 
+/* ---- Config-driven auto-load save state (cross-platform) ------------- *
+ * On the first frame after a ROM loads, the core reads a config file that
+ * sits next to it and is named after it: e.g. "genesis_plus_gx_libretro.cfg"
+ * beside "genesis_plus_gx_libretro.dll" / ".so". If enabled, it loads:
+ *
+ *     <save_path>/<rom-name-without-extension>.<state_ext>
+ *
+ * Genesis-Plus-GX supports Genesis/Mega Drive, Master System, Game Gear,
+ * and SG-1000 games. The user can specify multiple save_path entries
+ * (one per system) - the core tries them top-to-bottom.
+ *
+ * Windows : uses GetModuleHandleExA / GetModuleFileNameA (declared inline
+ *           to avoid #include <windows.h> which clashes with GPGX types).
+ * POSIX   : uses dladdr() from <dlfcn.h> (Linux, macOS, Android).
+ *
+ * NOTE: this file is C and lives in a large codebase, so instead of
+ * including <windows.h> (which can clash with GPGX's own types/macros) we
+ * declare the two Win32 functions we need directly. We also define LPCSTR
+ * locally since <windows.h> is not included.                              */
+
+/* --- platform abstractions --- */
+#ifdef _WIN32
+#define AUTOLOAD_STRCASECMP _stricmp
+#define AUTOLOAD_PATH_SEP   '\\'
+#define AUTOLOAD_MAX_PATH   260
+typedef const char* LPCSTR;
+#else
+#define AUTOLOAD_STRCASECMP strcasecmp
+#define AUTOLOAD_PATH_SEP   '/'
+#define AUTOLOAD_MAX_PATH   4096
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <dlfcn.h>
+#endif
+
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <time.h>
+
+#define AUTOLOAD_MAX_RUNS 25   /* keep only the latest N runs in autoload.log */
+#define AUTOLOAD_MAX_PATHS 16  /* max number of save_path entries in the config */
+
+#ifdef _WIN32
+#define AUTOLOAD_FROM_ADDRESS        0x00000004
+#define AUTOLOAD_UNCHANGED_REFCOUNT  0x00000002
+
+__declspec(dllimport)
+int           __stdcall GetModuleHandleExA(unsigned long dwFlags,
+                                           LPCSTR lpModuleName,
+                                           void **phModule);
+__declspec(dllimport)
+unsigned long __stdcall GetModuleFileNameA(void *hModule,
+                                           char *lpFilename,
+                                           unsigned long nSize);
+#endif
+
+static bool autoload_state_pending      = false;
+static bool autoload_hotkey_pending     = false;  /* Num1 pressed -> reset + autoload */
+static bool autoload_loadstate_pending  = false;  /* Num3 pressed -> load without reset */
+static char autoload_dir[AUTOLOAD_MAX_PATH]      = {0};
+static char autoload_rom_path[AUTOLOAD_MAX_PATH] = {0};
+static char autoload_core_name[64]      = {0};
+
+/* ---- Phase 2: multi-slot persistence (Num7/8) ---- */
+static int autoload_current_slot = 0;
+static int autoload_num_slots    = 1;
+static char autoload_slot_exts[16][64];
+
+/* ---- Phase 2: reload config flag (Num9) ---- */
+static bool autoload_config_pending_reload = false;
+
+static void autoload_get_self_dir(char *out, size_t out_size)
+{
+   out[0] = '\0';
+#ifdef _WIN32
+   void *hm = NULL;
+   char path[AUTOLOAD_MAX_PATH];
+   char *slash;
+   if (!GetModuleHandleExA(
+         AUTOLOAD_FROM_ADDRESS | AUTOLOAD_UNCHANGED_REFCOUNT,
+         (LPCSTR)&autoload_get_self_dir, &hm))
+      return;
+   if (!GetModuleFileNameA(hm, path, sizeof(path)))
+      return;
+   slash = strrchr(path, '\\');
+   if (slash) *slash = '\0';
+   strncpy(out, path, out_size - 1);
+   out[out_size - 1] = '\0';
+#else
+   Dl_info info;
+   if (dladdr((const void *)&autoload_get_self_dir, &info) && info.dli_fname)
+   {
+      char *slash;
+      strncpy(out, info.dli_fname, out_size - 1);
+      out[out_size - 1] = '\0';
+      slash = strrchr(out, '/');
+      if (slash) *slash = '\0';
+   }
+#endif
+}
+
+static void autoload_get_self_name(char *out, size_t out_size)
+{
+   out[0] = '\0';
+#ifdef _WIN32
+   void *hm = NULL;
+   char path[AUTOLOAD_MAX_PATH];
+   char *slash, *dot, *base;
+   if (!GetModuleHandleExA(
+         AUTOLOAD_FROM_ADDRESS | AUTOLOAD_UNCHANGED_REFCOUNT,
+         (LPCSTR)&autoload_get_self_name, &hm))
+      return;
+   if (!GetModuleFileNameA(hm, path, sizeof(path)))
+      return;
+   slash = strrchr(path, '\\');
+   base  = slash ? slash + 1 : path;
+   strncpy(out, base, out_size - 1);
+   out[out_size - 1] = '\0';
+   dot = strrchr(out, '.');
+   if (dot) *dot = '\0';
+#else
+   Dl_info info;
+   if (dladdr((const void *)&autoload_get_self_name, &info) && info.dli_fname)
+   {
+      char *slash, *dot, *base;
+      strncpy(out, info.dli_fname, out_size - 1);
+      out[out_size - 1] = '\0';
+      slash = strrchr(out, '/');
+      base  = slash ? slash + 1 : out;
+      if (base != out) memmove(out, base, strlen(base) + 1);
+      dot = strrchr(out, '.');
+      if (dot) *dot = '\0';
+   }
+#endif
+}
+
+static void autoload_get_self_cfg(char *out, size_t out_size)
+{
+   char name[64];
+   out[0] = '\0';
+   autoload_get_self_name(name, sizeof(name));
+   if (name[0] == '\0')
+      return;
+   if (autoload_dir[0] != '\0')
+      snprintf(out, out_size, "%s%c%s.cfg", autoload_dir, AUTOLOAD_PATH_SEP, name);
+   else
+      snprintf(out, out_size, "%s.cfg", name);
+}
+
+static void autoload_logf(const char *fmt, ...)
+{
+   char    line[1024];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+
+   if (log_cb)
+      log_cb(RETRO_LOG_INFO, "[autoload] %s\n", line);
+
+   if (autoload_dir[0] != '\0')
+   {
+      char logpath[AUTOLOAD_MAX_PATH + 32];
+      FILE *fp;
+      snprintf(logpath, sizeof(logpath), "%s%cautoload.log", autoload_dir, AUTOLOAD_PATH_SEP);
+      fp = fopen(logpath, "a");
+      if (fp) { fprintf(fp, "%s\n", line); fclose(fp); }
+   }
+}
+
+static void autoload_log_rotate(int keep_runs)
+{
+   char        logpath[AUTOLOAD_MAX_PATH + 32];
+   const char *marker = "--- autoload run ---";
+   FILE       *fp;
+   long        fsize;
+   char       *data, *p, *cut;
+   int         count = 0, seen = 0;
+   size_t      got;
+
+   if (autoload_dir[0] == '\0')
+      return;
+   snprintf(logpath, sizeof(logpath), "%s%cautoload.log", autoload_dir, AUTOLOAD_PATH_SEP);
+
+   fp = fopen(logpath, "rb");
+   if (!fp)
+      return;
+   fseek(fp, 0, SEEK_END);
+   fsize = ftell(fp);
+   fseek(fp, 0, SEEK_SET);
+   if (fsize <= 0) { fclose(fp); return; }
+   data = (char*)malloc((size_t)fsize + 1);
+   if (!data) { fclose(fp); return; }
+   got = fread(data, 1, (size_t)fsize, fp);
+   data[got] = '\0';
+   fclose(fp);
+
+   p = data;
+   while ((p = strstr(p, marker)) != NULL) { count++; p += 1; }
+
+   if (count > keep_runs)
+   {
+      int drop = count - keep_runs;
+      cut = data;
+      p   = data;
+      while ((p = strstr(p, marker)) != NULL)
+      {
+         if (++seen == drop + 1) { cut = p; break; }
+         p += 1;
+      }
+      fp = fopen(logpath, "wb");
+      if (fp) { fwrite(cut, 1, strlen(cut), fp); fclose(fp); }
+   }
+   free(data);
+}
+
+typedef struct
+{
+   bool enabled;
+   int  num_paths;
+   char save_paths[AUTOLOAD_MAX_PATHS][AUTOLOAD_MAX_PATH];
+   int  num_state_exts;
+   char state_exts[16][64];
+   int  current_slot;
+} autoload_config;
+
+static void autoload_trim(char *s)
+{
+   size_t len;
+   char  *start = s;
+   while (*start == ' ' || *start == '\t') start++;
+   if (start != s) memmove(s, start, strlen(start) + 1);
+   len = strlen(s);
+   while (len > 0 && (s[len-1] == '\r' || s[len-1] == '\n' ||
+                      s[len-1] == ' '  || s[len-1] == '\t'))
+      s[--len] = '\0';
+}
+
+static bool autoload_read_config(const char *cfg_path, autoload_config *cfg)
+{
+   FILE *fp;
+   char  line[1024];
+
+   cfg->enabled        = false;
+   cfg->num_paths      = 0;
+   cfg->num_state_exts = 0;
+   cfg->current_slot   = 0;
+   strcpy(cfg->state_exts[0], "state.auto");
+   cfg->num_state_exts = 1;
+
+   fp = fopen(cfg_path, "r");
+   if (!fp)
+      return false;
+
+   while (fgets(line, sizeof(line), fp))
+   {
+      char *eq, *key, *val;
+      if (line[0] == '#' || line[0] == ';')
+         continue;
+      eq = strchr(line, '=');
+      if (!eq)
+         continue;
+      *eq = '\0';
+      key = line;
+      val = eq + 1;
+      autoload_trim(key);
+      autoload_trim(val);
+
+      if (AUTOLOAD_STRCASECMP(key, "enabled") == 0)
+         cfg->enabled = (AUTOLOAD_STRCASECMP(val, "1")    == 0 ||
+                         AUTOLOAD_STRCASECMP(val, "true") == 0 ||
+                         AUTOLOAD_STRCASECMP(val, "yes")  == 0 ||
+                         AUTOLOAD_STRCASECMP(val, "on")   == 0);
+      else if (AUTOLOAD_STRCASECMP(key, "save_path") == 0)
+      {
+         if (cfg->num_paths < AUTOLOAD_MAX_PATHS && *val)
+         {
+            strncpy(cfg->save_paths[cfg->num_paths], val, AUTOLOAD_MAX_PATH - 1);
+            cfg->save_paths[cfg->num_paths][AUTOLOAD_MAX_PATH - 1] = '\0';
+            cfg->num_paths++;
+         }
+      }
+      else if (AUTOLOAD_STRCASECMP(key, "state_ext") == 0)
+      {
+         if (*val == '.') val++;
+         if (*val && cfg->num_state_exts < 16)
+         {
+            if (cfg->num_state_exts == 1 &&
+                strcmp(cfg->state_exts[0], "state.auto") == 0)
+            {
+               strncpy(cfg->state_exts[0], val, sizeof(cfg->state_exts[0]) - 1);
+               cfg->state_exts[0][sizeof(cfg->state_exts[0]) - 1] = '\0';
+            }
+            else
+            {
+               strncpy(cfg->state_exts[cfg->num_state_exts], val,
+                       sizeof(cfg->state_exts[0]) - 1);
+               cfg->state_exts[cfg->num_state_exts][sizeof(cfg->state_exts[0]) - 1] = '\0';
+               cfg->num_state_exts++;
+            }
+         }
+      }
+   }
+   fclose(fp);
+   return true;
+}
+
+static void autoload_rom_basename(char *out, size_t out_size)
+{
+   const char *p    = autoload_rom_path;
+   const char *hash = strrchr(p, '#');   /* archive separator, if any */
+   const char *base, *s1, *s2;
+   char *dot;
+
+   if (hash)
+      p = hash + 1;                       /* skip "<archive>.zip#" */
+
+   base = p;
+   s1   = strrchr(p, '\\');
+   s2   = strrchr(p, '/');
+   if (s1 && (!s2 || s1 > s2)) base = s1 + 1;
+   else if (s2)                base = s2 + 1;
+   strncpy(out, base, out_size - 1);
+   out[out_size - 1] = '\0';
+   dot = strrchr(out, '.');
+   if (dot) *dot = '\0';
+}
+
+static bool autoload_extract_rastate(const unsigned char *file, size_t file_len,
+                                     const unsigned char **out_data, size_t *out_size)
+{
+   const char *p    = (const char *)file;
+   const char *end  = p + file_len;
+   size_t      blocksize = 0;
+
+   if (file_len < 7 || memcmp(p, "RASTATE", 7) != 0)
+      return false;
+
+   p += 7;
+   while (p + 8 <= end)
+   {
+      if (memcmp(p, "END ", 4) == 0)
+         break;
+      blocksize = ((size_t)(unsigned char)p[4] << 24) |
+                  ((size_t)(unsigned char)p[5] << 16) |
+                  ((size_t)(unsigned char)p[6] <<  8) |
+                  ((size_t)(unsigned char)p[7]);
+      p += 8;
+      if (memcmp(p - 8, "MEM ", 4) == 0)
+      {
+         *out_data = (const unsigned char *)p;
+         *out_size = blocksize;
+         return true;
+      }
+      p += blocksize;
+   }
+   return false;
+}
+
+static void autoload_try_load_state(void)
+{
+   autoload_config cfg;
+   char            cfg_path[AUTOLOAD_MAX_PATH];
+   char            romname[AUTOLOAD_MAX_PATH];
+   char            file[AUTOLOAD_MAX_PATH * 3];
+   void           *buf        = NULL;
+   size_t          len        = 0;
+   size_t          expected   = retro_serialize_size();
+   const unsigned char *state_data = NULL;
+   size_t          state_size = 0;
+   size_t          plen;
+
+   autoload_get_self_dir(autoload_dir, sizeof(autoload_dir));
+   if (autoload_dir[0] == '\0')
+   {
+      if (log_cb)
+         log_cb(RETRO_LOG_WARN,
+               "[autoload] could not resolve core directory\n");
+      return;
+   }
+
+   autoload_get_self_name(autoload_core_name, sizeof(autoload_core_name));
+   autoload_log_rotate(AUTOLOAD_MAX_RUNS - 1);
+
+   {
+      time_t     t  = time(NULL);
+      struct tm *lt = localtime(&t);
+      char       ts[32];
+      if (lt) strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", lt);
+      else    ts[0] = '\0';
+      autoload_logf("--- autoload run --- core=%s  %s", autoload_core_name, ts);
+   }
+   autoload_logf("core directory : %s", autoload_dir);
+
+   autoload_get_self_cfg(cfg_path, sizeof(cfg_path));
+   autoload_logf("config file   : %s", cfg_path);
+
+   if (!autoload_read_config(cfg_path, &cfg))
+   {
+      autoload_logf("RESULT        : config file not found - nothing loaded");
+      return;
+   }
+
+   autoload_num_slots = cfg.num_state_exts;
+   memcpy(autoload_slot_exts, cfg.state_exts, sizeof(autoload_slot_exts));
+   if (autoload_current_slot >= autoload_num_slots)
+      autoload_current_slot = 0;
+   cfg.current_slot = autoload_current_slot;
+
+   if (!cfg.enabled)
+   {
+      autoload_logf("RESULT        : disabled in config (enabled=0)");
+      return;
+   }
+   if (cfg.num_paths == 0)
+   {
+      autoload_logf("RESULT        : no save_path in config");
+      return;
+   }
+   if (autoload_rom_path[0] == '\0')
+   {
+      autoload_logf("RESULT        : ROM path unknown (frontend gave none)");
+      return;
+   }
+
+   autoload_rom_basename(romname, sizeof(romname));
+   autoload_logf("rom path      : %s", autoload_rom_path);
+   autoload_logf("rom name      : %s", romname);
+   autoload_logf("state ext     : %s (slot %d/%d)",
+                 cfg.state_exts[cfg.current_slot],
+                 cfg.current_slot + 1, cfg.num_state_exts);
+   autoload_logf("core expects  : %u bytes", (unsigned)expected);
+
+   {
+      int  i;
+      bool found = false;
+      for (i = 0; i < cfg.num_paths; i++)
+      {
+         char  *sp = cfg.save_paths[i];
+         while ((plen = strlen(sp)) > 0 &&
+                (sp[plen-1] == '\\' || sp[plen-1] == '/'))
+            sp[plen-1] = '\0';
+
+         snprintf(file, sizeof(file), "%s%c%s.%s", sp, AUTOLOAD_PATH_SEP, romname,
+                  cfg.state_exts[cfg.current_slot]);
+         autoload_logf("trying        : %s", file);
+
+         {
+            FILE *fp = fopen(file, "rb");
+            if (fp)
+            {
+               long fsz;
+               fseek(fp, 0, SEEK_END);
+               fsz = ftell(fp);
+               fseek(fp, 0, SEEK_SET);
+               if (fsz > 0)
+               {
+                  buf = malloc((size_t)fsz);
+                  if (buf)
+                  {
+                     len = fread(buf, 1, (size_t)fsz, fp);
+                     autoload_logf("found in      : %s", sp);
+                     found = true;
+                  }
+               }
+               fclose(fp);
+            }
+         }
+         if (found) break;
+      }
+      if (!found)
+      {
+         autoload_logf("RESULT        : no matching state file in any save_path");
+         return;
+      }
+   }
+
+   autoload_logf("file size     : %d bytes", (int)len);
+
+   if (buf && len > 0)
+   {
+      if (autoload_extract_rastate((const unsigned char*)buf, len,
+                                   &state_data, &state_size))
+         autoload_logf("RASTATE       : container detected, MEM block = %u bytes",
+                       (unsigned)state_size);
+      else
+      {
+         state_data = (const unsigned char*)buf;
+         state_size = len;
+         autoload_logf("RASTATE       : not a container, using raw file");
+      }
+
+      if (state_size != expected)
+         autoload_logf("WARNING       : state is %u bytes but core expects %u "
+                       "(wrong ROM, or RetroArch 'Save State Compression' is ON "
+                       "- turn it OFF and re-save).",
+                       (unsigned)state_size, (unsigned)expected);
+
+      if (retro_unserialize(state_data, state_size))
+         autoload_logf("RESULT        : state loaded OK");
+      else
+         autoload_logf("RESULT        : retro_unserialize() refused the data");
+   }
+   else
+      autoload_logf("RESULT        : file was empty");
+
+   if (buf)
+      free(buf);
+}
+
+/* ---- Per-ROM cheats (GPGX main RAM via retro_get_memory_data) -------- *
+ * The user sets a "cheats_path" in the main .cfg that points to a folder.
+ * Inside that folder, per-ROM cheat files live, named "<rom-basename>.cfg".
+ *
+ * Genesis-Plus-GX supports Genesis/Mega Drive, Master System, Game Gear,
+ * and SG-1000 games. The user can specify multiple cheats_path entries
+ * (one per system) - the core tries them top-to-bottom.
+ *
+ * Address is an offset into the core's exposed System RAM:
+ *   - Genesis/Mega Drive: work_ram at CPU $FF0000 (64 KB)
+ *   - Master System/Game Gear: RAM at CPU $C000 (8 KB)
+ *   - SG-1000: RAM at CPU $C000 (1 KB)
+ *
+ * Hotkeys:
+ *   Numpad 0  - toggle const cheats on/off (default: on at boot)
+ *   Numpad 2  - apply oneshot cheats once
+ *                                                                   */
+
+#define CHEATS_MAX_ENTRIES  64
+#define CHEATS_MAX_PATHS    16
+
+typedef struct
+{
+   uint32_t addr;
+   uint8_t  val;
+   bool     is_const;
+   bool     is_auto;
+} cheat_entry;
+
+static cheat_entry cheats_list[CHEATS_MAX_ENTRIES];
+static int         cheats_count          = 0;
+static bool        cheats_const_enabled  = true;
+static bool        cheats_oneshot_pending = false;
+static bool        cheats_pending_reload = true;
+
+static char cheats_paths[CHEATS_MAX_PATHS][AUTOLOAD_MAX_PATH];
+static int  cheats_paths_count = 0;
+
+static uint8_t *cheats_get_ram_ptr(void)
+{
+   void *p = retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+   return (uint8_t *)p;
+}
+
+static size_t cheats_get_ram_size(void)
+{
+   return retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
+}
+
+static void cheats_read_paths_from_cfg(const char *cfg_path)
+{
+   FILE *fp;
+   char  line[1024];
+
+   cheats_paths_count = 0;
+   fp = fopen(cfg_path, "r");
+   if (!fp)
+      return;
+
+   while (fgets(line, sizeof(line), fp) && cheats_paths_count < CHEATS_MAX_PATHS)
+   {
+      char *p, *eq;
+      autoload_trim(line);
+      if (line[0] == '\0' || line[0] == '#' || line[0] == ';' || line[0] == '[')
+         continue;
+      if (strncmp(line, "cheats_path", 11) != 0)
+         continue;
+      eq = strchr(line, '=');
+      if (!eq)
+         continue;
+      p = eq + 1;
+      while (*p == ' ' || *p == '\t') p++;
+      strncpy(cheats_paths[cheats_paths_count], p, AUTOLOAD_MAX_PATH - 1);
+      cheats_paths[cheats_paths_count][AUTOLOAD_MAX_PATH - 1] = '\0';
+      cheats_paths_count++;
+   }
+   fclose(fp);
+}
+
+static bool cheats_find_rom_cfg(char *out, size_t out_size)
+{
+   int   i;
+   char  rom_base[AUTOLOAD_MAX_PATH];
+   char *dot;
+   const char *cslash;
+
+   out[0] = '\0';
+   rom_base[0] = '\0';
+
+   if (autoload_rom_path[0] == '\0')
+      return false;
+
+   {
+      const char *start = autoload_rom_path;
+      const char *hash = strrchr(start, '#');   /* archive separator */
+      if (hash)
+         start = hash + 1;                       /* skip "<archive>.zip#" */
+      cslash = strrchr(start, AUTOLOAD_PATH_SEP);
+      strncpy(rom_base, cslash ? cslash + 1 : start, sizeof(rom_base) - 1);
+      rom_base[sizeof(rom_base) - 1] = '\0';
+   }
+   dot = strrchr(rom_base, '.');
+   if (dot) *dot = '\0';
+
+   if (rom_base[0] == '\0')
+      return false;
+
+   for (i = 0; i < cheats_paths_count; i++)
+   {
+      FILE *fp;
+      snprintf(out, out_size, "%s%c%s.cfg",
+               cheats_paths[i], AUTOLOAD_PATH_SEP, rom_base);
+      fp = fopen(out, "r");
+      if (fp)
+      {
+         fclose(fp);
+         return true;
+      }
+   }
+   out[0] = '\0';
+   return false;
+}
+
+static bool cheats_parse_line(const char *line, cheat_entry *out_entry)
+{
+   char  buf[256];
+   char *eq, *p, *endptr;
+   long  addr_l, val_l;
+
+   strncpy(buf, line, sizeof(buf) - 1);
+   buf[sizeof(buf) - 1] = '\0';
+   autoload_trim(buf);
+
+   eq = strchr(buf, '=');
+   if (!eq)
+      return false;
+
+   *eq = '\0';
+   p = buf;
+   addr_l = strtol(p, &endptr, 0);
+   if (endptr == p || addr_l < 0)
+      return false;
+
+   p = eq + 1;
+   {
+      char *bracket = strchr(p, '[');
+      char *bracket2;
+      if (bracket) *bracket = '\0';
+      autoload_trim(p);
+      val_l = strtol(p, &endptr, 0);
+      if (endptr == p || val_l < 0 || val_l > 0xFF)
+         return false;
+      out_entry->is_const = false;
+      out_entry->is_auto  = false;
+      while (bracket)
+      {
+         bracket2 = strchr(bracket, '[');
+         if (!bracket2) break;
+         {
+            char *close = strchr(bracket2, ']');
+            char  flag[32];
+            size_t flen;
+            if (!close) break;
+            flen = close - bracket2 - 1;
+            if (flen >= sizeof(flag)) flen = sizeof(flag) - 1;
+            memcpy(flag, bracket2 + 1, flen);
+            flag[flen] = '\0';
+            if (AUTOLOAD_STRCASECMP(flag, "const") == 0)
+               out_entry->is_const = true;
+            else if (AUTOLOAD_STRCASECMP(flag, "auto") == 0)
+               out_entry->is_auto = true;
+            bracket = close + 1;
+         }
+      }
+   }
+
+   out_entry->addr = (uint32_t)addr_l;
+   out_entry->val  = (uint8_t)val_l;
+   return true;
+}
+
+static int cheats_load_for_rom(const char *rom_cfg_path)
+{
+   FILE *fp;
+   char  line[1024];
+   int   loaded = 0;
+
+   cheats_count = 0;
+   memset(cheats_list, 0, sizeof(cheats_list));
+
+   fp = fopen(rom_cfg_path, "r");
+   if (!fp)
+      return -1;
+
+   while (fgets(line, sizeof(line), fp))
+   {
+      cheat_entry e;
+      autoload_trim(line);
+      if (line[0] == '\0' || line[0] == '#' || line[0] == ';')
+         continue;
+      if (cheats_count >= CHEATS_MAX_ENTRIES)
+      {
+         autoload_logf("CHEATS        : max %d entries reached, ignoring rest",
+                       CHEATS_MAX_ENTRIES);
+         break;
+      }
+      if (cheats_parse_line(line, &e))
+      {
+         cheats_list[cheats_count++] = e;
+         loaded++;
+         autoload_logf("CHEATS        : loaded 0x%x = 0x%02x%s%s",
+                       (unsigned)e.addr, (unsigned)e.val,
+                       e.is_const ? " [const]" : "",
+                       e.is_auto  ? " [auto]"  : "");
+      }
+      else
+         autoload_logf("CHEATS        : skip malformed line: %s", line);
+   }
+
+   fclose(fp);
+   return loaded;
+}
+
+static void cheats_apply_const(void)
+{
+   int i;
+   uint8_t *ram = cheats_get_ram_ptr();
+   size_t   sz  = cheats_get_ram_size();
+   if (!ram || sz == 0)
+      return;
+   for (i = 0; i < cheats_count; i++)
+   {
+      if (cheats_list[i].is_const && cheats_list[i].addr < sz)
+         ram[cheats_list[i].addr] = cheats_list[i].val;
+   }
+}
+
+static void cheats_apply_oneshot(void)
+{
+   int i;
+   int applied = 0;
+   uint8_t *ram = cheats_get_ram_ptr();
+   size_t   sz  = cheats_get_ram_size();
+   if (!ram || sz == 0)
+   {
+      autoload_logf("CHEATS        : Num2 pressed but no System RAM available");
+      return;
+   }
+   for (i = 0; i < cheats_count; i++)
+   {
+      if (!cheats_list[i].is_const && cheats_list[i].addr < sz)
+      {
+         ram[cheats_list[i].addr] = cheats_list[i].val;
+         applied++;
+      }
+   }
+   autoload_logf("CHEATS        : Num2 pressed, applied %d oneshot cheats", applied);
+}
+
+static void cheats_apply_auto(void)
+{
+   int i;
+   int applied = 0;
+   uint8_t *ram = cheats_get_ram_ptr();
+   size_t   sz  = cheats_get_ram_size();
+   if (!ram || sz == 0)
+      return;
+   for (i = 0; i < cheats_count; i++)
+   {
+      if (cheats_list[i].is_auto && cheats_list[i].addr < sz)
+      {
+         ram[cheats_list[i].addr] = cheats_list[i].val;
+         applied++;
+      }
+   }
+   autoload_logf("CHEATS        : auto-applied %d [auto] cheat(s) on ROM load", applied);
+}
+
+static void cheats_maybe_reload(void)
+{
+   char core_cfg[AUTOLOAD_MAX_PATH];
+   char rom_cfg[AUTOLOAD_MAX_PATH];
+   int  loaded;
+
+   if (!cheats_pending_reload)
+      return;
+   cheats_pending_reload = false;
+
+   autoload_get_self_cfg(core_cfg, sizeof(core_cfg));
+   if (core_cfg[0] == '\0')
+   {
+      autoload_logf("CHEATS        : could not locate core .cfg, cheats disabled");
+      return;
+   }
+
+   cheats_read_paths_from_cfg(core_cfg);
+   if (cheats_paths_count == 0)
+   {
+      autoload_logf("CHEATS        : no 'cheats_path' in %s, cheats disabled", core_cfg);
+      return;
+   }
+
+   if (!cheats_find_rom_cfg(rom_cfg, sizeof(rom_cfg)))
+   {
+      autoload_logf("CHEATS        : no per-ROM .cfg found for '%s'",
+                    autoload_rom_path[0] ? autoload_rom_path : "(no rom)");
+      return;
+   }
+
+   loaded = cheats_load_for_rom(rom_cfg);
+   if (loaded < 0)
+   {
+      autoload_logf("CHEATS        : could not read %s", rom_cfg);
+      return;
+   }
+   autoload_logf("CHEATS        : %d cheat(s) loaded from %s", loaded, rom_cfg);
+
+   if (loaded > 0)
+      cheats_apply_auto();
+}
+
 bool retro_load_game(const struct retro_game_info *info)
 {
    int i;
@@ -3878,831 +4711,6 @@ void retro_reset(void)
 extern int8 audio_hard_disable;
 
 extern void sound_update_fm_function_pointers(void);
-
-/* ---- Config-driven auto-load save state (cross-platform) ------------- *
- * On the first frame after a ROM loads, the core reads a config file that
- * sits next to it and is named after it: e.g. "genesis_plus_gx_libretro.cfg"
- * beside "genesis_plus_gx_libretro.dll" / ".so". If enabled, it loads:
- *
- *     <save_path>/<rom-name-without-extension>.<state_ext>
- *
- * Genesis-Plus-GX supports Genesis/Mega Drive, Master System, Game Gear,
- * and SG-1000 games. The user can specify multiple save_path entries
- * (one per system) - the core tries them top-to-bottom.
- *
- * A line is written to "autoload.log" beside the core for diagnostics.
- *
- * Windows : uses GetModuleHandleExA / GetModuleFileNameA (declared inline
- *           to avoid #include <windows.h> which clashes with GPGX types).
- * POSIX   : uses dladdr() from <dlfcn.h> (Linux, macOS, Android).
- *
- * NOTE: this file is C and lives in a large codebase, so instead of
- * including <windows.h> (which can clash with GPGX's own types/macros) we
- * declare the two Win32 functions we need directly.                       */
-
-/* --- platform abstractions --- */
-#ifdef _WIN32
-#define AUTOLOAD_STRCASECMP _stricmp
-#define AUTOLOAD_PATH_SEP   '\\'
-#define AUTOLOAD_MAX_PATH   260
-#else
-#define AUTOLOAD_STRCASECMP strcasecmp
-#define AUTOLOAD_PATH_SEP   '/'
-#define AUTOLOAD_MAX_PATH   4096
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-#include <dlfcn.h>
-#endif
-
-#include <stdio.h>
-#include <stdarg.h>
-#include <string.h>
-#include <time.h>
-
-#define AUTOLOAD_MAX_RUNS 25   /* keep only the latest N runs in autoload.log */
-#define AUTOLOAD_MAX_PATHS 16  /* max number of save_path entries in the config */
-
-#ifdef _WIN32
-#define AUTOLOAD_FROM_ADDRESS        0x00000004
-#define AUTOLOAD_UNCHANGED_REFCOUNT  0x00000002
-
-__declspec(dllimport)
-int           __stdcall GetModuleHandleExA(unsigned long dwFlags,
-                                           const char *lpModuleName,
-                                           void **phModule);
-__declspec(dllimport)
-unsigned long __stdcall GetModuleFileNameA(void *hModule,
-                                           char *lpFilename,
-                                           unsigned long nSize);
-#endif
-
-static bool autoload_state_pending      = false;
-static bool autoload_hotkey_pending     = false;  /* Num1 pressed -> reset + autoload */
-static bool autoload_loadstate_pending  = false;  /* Num3 pressed -> load without reset */
-static char autoload_dir[AUTOLOAD_MAX_PATH]      = {0};
-static char autoload_rom_path[AUTOLOAD_MAX_PATH] = {0};
-static char autoload_core_name[64]      = {0};
-
-/* ---- Phase 2: multi-slot persistence (Num7/8) ---- */
-static int autoload_current_slot = 0;
-static int autoload_num_slots    = 1;
-static char autoload_slot_exts[16][64];
-
-/* ---- Phase 2: reload config flag (Num9) ---- */
-static bool autoload_config_pending_reload = false;
-
-static void autoload_get_self_dir(char *out, size_t out_size)
-{
-   out[0] = '\0';
-#ifdef _WIN32
-   void *hm = NULL;
-   char path[AUTOLOAD_MAX_PATH];
-   char *slash;
-   if (!GetModuleHandleExA(
-         AUTOLOAD_FROM_ADDRESS | AUTOLOAD_UNCHANGED_REFCOUNT,
-         (LPCSTR)&autoload_get_self_dir, &hm))
-      return;
-   if (!GetModuleFileNameA(hm, path, sizeof(path)))
-      return;
-   slash = strrchr(path, '\\');
-   if (slash) *slash = '\0';
-   strncpy(out, path, out_size - 1);
-   out[out_size - 1] = '\0';
-#else
-   Dl_info info;
-   if (dladdr((const void *)&autoload_get_self_dir, &info) && info.dli_fname)
-   {
-      char *slash;
-      strncpy(out, info.dli_fname, out_size - 1);
-      out[out_size - 1] = '\0';
-      slash = strrchr(out, '/');
-      if (slash) *slash = '\0';
-   }
-#endif
-}
-
-static void autoload_get_self_name(char *out, size_t out_size)
-{
-   out[0] = '\0';
-#ifdef _WIN32
-   void *hm = NULL;
-   char path[AUTOLOAD_MAX_PATH];
-   char *slash, *dot, *base;
-   if (!GetModuleHandleExA(
-         AUTOLOAD_FROM_ADDRESS | AUTOLOAD_UNCHANGED_REFCOUNT,
-         (LPCSTR)&autoload_get_self_name, &hm))
-      return;
-   if (!GetModuleFileNameA(hm, path, sizeof(path)))
-      return;
-   slash = strrchr(path, '\\');
-   base  = slash ? slash + 1 : path;
-   strncpy(out, base, out_size - 1);
-   out[out_size - 1] = '\0';
-   dot = strrchr(out, '.');
-   if (dot) *dot = '\0';
-#else
-   Dl_info info;
-   if (dladdr((const void *)&autoload_get_self_name, &info) && info.dli_fname)
-   {
-      char *slash, *dot, *base;
-      strncpy(out, info.dli_fname, out_size - 1);
-      out[out_size - 1] = '\0';
-      slash = strrchr(out, '/');
-      base  = slash ? slash + 1 : out;
-      if (base != out) memmove(out, base, strlen(base) + 1);
-      dot = strrchr(out, '.');
-      if (dot) *dot = '\0';
-   }
-#endif
-}
-
-static void autoload_get_self_cfg(char *out, size_t out_size)
-{
-   char name[64];
-   out[0] = '\0';
-   autoload_get_self_name(name, sizeof(name));
-   if (name[0] == '\0')
-      return;
-   if (autoload_dir[0] != '\0')
-      snprintf(out, out_size, "%s%c%s.cfg", autoload_dir, AUTOLOAD_PATH_SEP, name);
-   else
-      snprintf(out, out_size, "%s.cfg", name);
-}
-
-static void autoload_logf(const char *fmt, ...)
-{
-   char    line[1024];
-   va_list ap;
-   va_start(ap, fmt);
-   vsnprintf(line, sizeof(line), fmt, ap);
-   va_end(ap);
-
-   if (log_cb)
-      log_cb(RETRO_LOG_INFO, "[autoload] %s\n", line);
-
-   if (autoload_dir[0] != '\0')
-   {
-      char logpath[AUTOLOAD_MAX_PATH + 32];
-      FILE *fp;
-      snprintf(logpath, sizeof(logpath), "%s%cautoload.log", autoload_dir, AUTOLOAD_PATH_SEP);
-      fp = fopen(logpath, "a");
-      if (fp) { fprintf(fp, "%s\n", line); fclose(fp); }
-   }
-}
-
-static void autoload_log_rotate(int keep_runs)
-{
-   char        logpath[AUTOLOAD_MAX_PATH + 32];
-   const char *marker = "--- autoload run ---";
-   FILE       *fp;
-   long        fsize;
-   char       *data, *p, *cut;
-   int         count = 0, seen = 0;
-   size_t      got;
-
-   if (autoload_dir[0] == '\0')
-      return;
-   snprintf(logpath, sizeof(logpath), "%s%cautoload.log", autoload_dir, AUTOLOAD_PATH_SEP);
-
-   fp = fopen(logpath, "rb");
-   if (!fp)
-      return;
-   fseek(fp, 0, SEEK_END);
-   fsize = ftell(fp);
-   fseek(fp, 0, SEEK_SET);
-   if (fsize <= 0) { fclose(fp); return; }
-   data = (char*)malloc((size_t)fsize + 1);
-   if (!data) { fclose(fp); return; }
-   got = fread(data, 1, (size_t)fsize, fp);
-   data[got] = '\0';
-   fclose(fp);
-
-   p = data;
-   while ((p = strstr(p, marker)) != NULL) { count++; p += 1; }
-
-   if (count > keep_runs)
-   {
-      int drop = count - keep_runs;
-      cut = data;
-      p   = data;
-      while ((p = strstr(p, marker)) != NULL)
-      {
-         if (++seen == drop + 1) { cut = p; break; }
-         p += 1;
-      }
-      fp = fopen(logpath, "wb");
-      if (fp) { fwrite(cut, 1, strlen(cut), fp); fclose(fp); }
-   }
-   free(data);
-}
-
-typedef struct
-{
-   bool enabled;
-   int  num_paths;
-   char save_paths[AUTOLOAD_MAX_PATHS][AUTOLOAD_MAX_PATH];
-   int  num_state_exts;
-   char state_exts[16][64];
-   int  current_slot;
-} autoload_config;
-
-static void autoload_trim(char *s)
-{
-   size_t len;
-   char  *start = s;
-   while (*start == ' ' || *start == '\t') start++;
-   if (start != s) memmove(s, start, strlen(start) + 1);
-   len = strlen(s);
-   while (len > 0 && (s[len-1] == '\r' || s[len-1] == '\n' ||
-                      s[len-1] == ' '  || s[len-1] == '\t'))
-      s[--len] = '\0';
-}
-
-static bool autoload_read_config(const char *cfg_path, autoload_config *cfg)
-{
-   FILE *fp;
-   char  line[1024];
-
-   cfg->enabled        = false;
-   cfg->num_paths      = 0;
-   cfg->num_state_exts = 0;
-   cfg->current_slot   = 0;
-   strcpy(cfg->state_exts[0], "state.auto");
-   cfg->num_state_exts = 1;
-
-   fp = fopen(cfg_path, "r");
-   if (!fp)
-      return false;
-
-   while (fgets(line, sizeof(line), fp))
-   {
-      char *eq, *key, *val;
-      if (line[0] == '#' || line[0] == ';')
-         continue;
-      eq = strchr(line, '=');
-      if (!eq)
-         continue;
-      *eq = '\0';
-      key = line;
-      val = eq + 1;
-      autoload_trim(key);
-      autoload_trim(val);
-
-      if (AUTOLOAD_STRCASECMP(key, "enabled") == 0)
-         cfg->enabled = (AUTOLOAD_STRCASECMP(val, "1")    == 0 ||
-                         AUTOLOAD_STRCASECMP(val, "true") == 0 ||
-                         AUTOLOAD_STRCASECMP(val, "yes")  == 0 ||
-                         AUTOLOAD_STRCASECMP(val, "on")   == 0);
-      else if (AUTOLOAD_STRCASECMP(key, "save_path") == 0)
-      {
-         if (cfg->num_paths < AUTOLOAD_MAX_PATHS && *val)
-         {
-            strncpy(cfg->save_paths[cfg->num_paths], val, AUTOLOAD_MAX_PATH - 1);
-            cfg->save_paths[cfg->num_paths][AUTOLOAD_MAX_PATH - 1] = '\0';
-            cfg->num_paths++;
-         }
-      }
-      else if (AUTOLOAD_STRCASECMP(key, "state_ext") == 0)
-      {
-         if (*val == '.') val++;
-         if (*val && cfg->num_state_exts < 16)
-         {
-            if (cfg->num_state_exts == 1 &&
-                strcmp(cfg->state_exts[0], "state.auto") == 0)
-            {
-               strncpy(cfg->state_exts[0], val, sizeof(cfg->state_exts[0]) - 1);
-               cfg->state_exts[0][sizeof(cfg->state_exts[0]) - 1] = '\0';
-            }
-            else
-            {
-               strncpy(cfg->state_exts[cfg->num_state_exts], val,
-                       sizeof(cfg->state_exts[0]) - 1);
-               cfg->state_exts[cfg->num_state_exts][sizeof(cfg->state_exts[0]) - 1] = '\0';
-               cfg->num_state_exts++;
-            }
-         }
-      }
-   }
-   fclose(fp);
-   return true;
-}
-
-static void autoload_rom_basename(char *out, size_t out_size)
-{
-   const char *p    = autoload_rom_path;
-   const char *base, *s1, *s2;
-   char *dot;
-   base = p;
-   s1   = strrchr(p, '\\');
-   s2   = strrchr(p, '/');
-   if (s1 && (!s2 || s1 > s2)) base = s1 + 1;
-   else if (s2)                base = s2 + 1;
-   strncpy(out, base, out_size - 1);
-   out[out_size - 1] = '\0';
-   dot = strrchr(out, '.');
-   if (dot) *dot = '\0';
-}
-
-static bool autoload_extract_rastate(const unsigned char *file, size_t file_len,
-                                     const unsigned char **out_data, size_t *out_size)
-{
-   const char *p    = (const char *)file;
-   const char *end  = p + file_len;
-   size_t      blocksize = 0;
-
-   if (file_len < 7 || memcmp(p, "RASTATE", 7) != 0)
-      return false;
-
-   p += 7;
-   while (p + 8 <= end)
-   {
-      if (memcmp(p, "END ", 4) == 0)
-         break;
-      blocksize = ((size_t)(unsigned char)p[4] << 24) |
-                  ((size_t)(unsigned char)p[5] << 16) |
-                  ((size_t)(unsigned char)p[6] <<  8) |
-                  ((size_t)(unsigned char)p[7]);
-      p += 8;
-      if (memcmp(p - 8, "MEM ", 4) == 0)
-      {
-         *out_data = (const unsigned char *)p;
-         *out_size = blocksize;
-         return true;
-      }
-      p += blocksize;
-   }
-   return false;
-}
-
-static void autoload_try_load_state(void)
-{
-   autoload_config cfg;
-   char            cfg_path[AUTOLOAD_MAX_PATH];
-   char            romname[AUTOLOAD_MAX_PATH];
-   char            file[AUTOLOAD_MAX_PATH * 3];
-   void           *buf        = NULL;
-   size_t          len        = 0;
-   size_t          expected   = retro_serialize_size();
-   const unsigned char *state_data = NULL;
-   size_t          state_size = 0;
-   size_t          plen;
-
-   autoload_get_self_dir(autoload_dir, sizeof(autoload_dir));
-   if (autoload_dir[0] == '\0')
-   {
-      if (log_cb)
-         log_cb(RETRO_LOG_WARN,
-               "[autoload] could not resolve core directory\n");
-      return;
-   }
-
-   autoload_get_self_name(autoload_core_name, sizeof(autoload_core_name));
-   autoload_log_rotate(AUTOLOAD_MAX_RUNS - 1);
-
-   {
-      time_t     t  = time(NULL);
-      struct tm *lt = localtime(&t);
-      char       ts[32];
-      if (lt) strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", lt);
-      else    ts[0] = '\0';
-      autoload_logf("--- autoload run --- core=%s  %s", autoload_core_name, ts);
-   }
-   autoload_logf("core directory : %s", autoload_dir);
-
-   autoload_get_self_cfg(cfg_path, sizeof(cfg_path));
-   autoload_logf("config file   : %s", cfg_path);
-
-   if (!autoload_read_config(cfg_path, &cfg))
-   {
-      autoload_logf("RESULT        : config file not found - nothing loaded");
-      return;
-   }
-
-   autoload_num_slots = cfg.num_state_exts;
-   memcpy(autoload_slot_exts, cfg.state_exts, sizeof(autoload_slot_exts));
-   if (autoload_current_slot >= autoload_num_slots)
-      autoload_current_slot = 0;
-   cfg.current_slot = autoload_current_slot;
-
-   if (!cfg.enabled)
-   {
-      autoload_logf("RESULT        : disabled in config (enabled=0)");
-      return;
-   }
-   if (cfg.num_paths == 0)
-   {
-      autoload_logf("RESULT        : no save_path in config");
-      return;
-   }
-   if (autoload_rom_path[0] == '\0')
-   {
-      autoload_logf("RESULT        : ROM path unknown (frontend gave none)");
-      return;
-   }
-
-   autoload_rom_basename(romname, sizeof(romname));
-   autoload_logf("rom path      : %s", autoload_rom_path);
-   autoload_logf("rom name      : %s", romname);
-   autoload_logf("state ext     : %s (slot %d/%d)",
-                 cfg.state_exts[cfg.current_slot],
-                 cfg.current_slot + 1, cfg.num_state_exts);
-   autoload_logf("core expects  : %u bytes", (unsigned)expected);
-
-   {
-      int  i;
-      bool found = false;
-      for (i = 0; i < cfg.num_paths; i++)
-      {
-         char  *sp = cfg.save_paths[i];
-         while ((plen = strlen(sp)) > 0 &&
-                (sp[plen-1] == '\\' || sp[plen-1] == '/'))
-            sp[plen-1] = '\0';
-
-         snprintf(file, sizeof(file), "%s%c%s.%s", sp, AUTOLOAD_PATH_SEP, romname,
-                  cfg.state_exts[cfg.current_slot]);
-         autoload_logf("trying        : %s", file);
-
-         {
-            FILE *fp = fopen(file, "rb");
-            if (fp)
-            {
-               long fsz;
-               fseek(fp, 0, SEEK_END);
-               fsz = ftell(fp);
-               fseek(fp, 0, SEEK_SET);
-               if (fsz > 0)
-               {
-                  buf = malloc((size_t)fsz);
-                  if (buf)
-                  {
-                     len = fread(buf, 1, (size_t)fsz, fp);
-                     autoload_logf("found in      : %s", sp);
-                     found = true;
-                  }
-               }
-               fclose(fp);
-            }
-         }
-         if (found) break;
-      }
-      if (!found)
-      {
-         autoload_logf("RESULT        : no matching state file in any save_path");
-         return;
-      }
-   }
-
-   autoload_logf("file size     : %d bytes", (int)len);
-
-   if (buf && len > 0)
-   {
-      if (autoload_extract_rastate((const unsigned char*)buf, len,
-                                   &state_data, &state_size))
-         autoload_logf("RASTATE       : container detected, MEM block = %u bytes",
-                       (unsigned)state_size);
-      else
-      {
-         state_data = (const unsigned char*)buf;
-         state_size = len;
-         autoload_logf("RASTATE       : not a container, using raw file");
-      }
-
-      if (state_size != expected)
-         autoload_logf("WARNING       : state is %u bytes but core expects %u "
-                       "(wrong ROM, or RetroArch 'Save State Compression' is ON "
-                       "- turn it OFF and re-save).",
-                       (unsigned)state_size, (unsigned)expected);
-
-      if (retro_unserialize(state_data, state_size))
-         autoload_logf("RESULT        : state loaded OK");
-      else
-         autoload_logf("RESULT        : retro_unserialize() refused the data");
-   }
-   else
-      autoload_logf("RESULT        : file was empty");
-
-   if (buf)
-      free(buf);
-}
-
-/* ---- Per-ROM cheats (GPGX main RAM via retro_get_memory_data) -------- *
- * The user sets a "cheats_path" in the main .cfg that points to a folder.
- * Inside that folder, per-ROM cheat files live, named "<rom-basename>.cfg".
- *
- * Genesis-Plus-GX supports Genesis/Mega Drive, Master System, Game Gear,
- * and SG-1000 games. The user can specify multiple cheats_path entries
- * (one per system) - the core tries them top-to-bottom.
- *
- * Address is an offset into the core's exposed System RAM:
- *   - Genesis/Mega Drive: work_ram at CPU $FF0000 (64 KB)
- *   - Master System/Game Gear: RAM at CPU $C000 (8 KB)
- *   - SG-1000: RAM at CPU $C000 (1 KB)
- *
- * Hotkeys:
- *   Numpad 0  - toggle const cheats on/off (default: on at boot)
- *   Numpad 2  - apply oneshot cheats once
- *                                                                   */
-
-#define CHEATS_MAX_ENTRIES  64
-#define CHEATS_MAX_PATHS    16
-
-typedef struct
-{
-   uint32_t addr;
-   uint8_t  val;
-   bool     is_const;
-   bool     is_auto;
-} cheat_entry;
-
-static cheat_entry cheats_list[CHEATS_MAX_ENTRIES];
-static int         cheats_count          = 0;
-static bool        cheats_const_enabled  = true;
-static bool        cheats_oneshot_pending = false;
-static bool        cheats_pending_reload = true;
-
-static char cheats_paths[CHEATS_MAX_PATHS][AUTOLOAD_MAX_PATH];
-static int  cheats_paths_count = 0;
-
-static uint8_t *cheats_get_ram_ptr(void)
-{
-   void *p = retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
-   return (uint8_t *)p;
-}
-
-static size_t cheats_get_ram_size(void)
-{
-   return retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
-}
-
-static void cheats_read_paths_from_cfg(const char *cfg_path)
-{
-   FILE *fp;
-   char  line[1024];
-
-   cheats_paths_count = 0;
-   fp = fopen(cfg_path, "r");
-   if (!fp)
-      return;
-
-   while (fgets(line, sizeof(line), fp) && cheats_paths_count < CHEATS_MAX_PATHS)
-   {
-      char *p, *eq;
-      autoload_trim(line);
-      if (line[0] == '\0' || line[0] == '#' || line[0] == ';' || line[0] == '[')
-         continue;
-      if (strncmp(line, "cheats_path", 11) != 0)
-         continue;
-      eq = strchr(line, '=');
-      if (!eq)
-         continue;
-      p = eq + 1;
-      while (*p == ' ' || *p == '\t') p++;
-      strncpy(cheats_paths[cheats_paths_count], p, AUTOLOAD_MAX_PATH - 1);
-      cheats_paths[cheats_paths_count][AUTOLOAD_MAX_PATH - 1] = '\0';
-      cheats_paths_count++;
-   }
-   fclose(fp);
-}
-
-static bool cheats_find_rom_cfg(char *out, size_t out_size)
-{
-   int   i;
-   char  rom_base[AUTOLOAD_MAX_PATH];
-   char *dot;
-   const char *cslash;
-
-   out[0] = '\0';
-   rom_base[0] = '\0';
-
-   if (autoload_rom_path[0] == '\0')
-      return false;
-
-   {
-      const char *start = autoload_rom_path;
-      cslash = strrchr(start, AUTOLOAD_PATH_SEP);
-      strncpy(rom_base, cslash ? cslash + 1 : start, sizeof(rom_base) - 1);
-      rom_base[sizeof(rom_base) - 1] = '\0';
-   }
-   dot = strrchr(rom_base, '.');
-   if (dot) *dot = '\0';
-
-   if (rom_base[0] == '\0')
-      return false;
-
-   for (i = 0; i < cheats_paths_count; i++)
-   {
-      FILE *fp;
-      snprintf(out, out_size, "%s%c%s.cfg",
-               cheats_paths[i], AUTOLOAD_PATH_SEP, rom_base);
-      fp = fopen(out, "r");
-      if (fp)
-      {
-         fclose(fp);
-         return true;
-      }
-   }
-   out[0] = '\0';
-   return false;
-}
-
-static bool cheats_parse_line(const char *line, cheat_entry *out_entry)
-{
-   char  buf[256];
-   char *eq, *p, *endptr;
-   long  addr_l, val_l;
-
-   strncpy(buf, line, sizeof(buf) - 1);
-   buf[sizeof(buf) - 1] = '\0';
-   autoload_trim(buf);
-
-   eq = strchr(buf, '=');
-   if (!eq)
-      return false;
-
-   *eq = '\0';
-   p = buf;
-   addr_l = strtol(p, &endptr, 0);
-   if (endptr == p || addr_l < 0)
-      return false;
-
-   p = eq + 1;
-   {
-      char *bracket = strchr(p, '[');
-      char *bracket2;
-      if (bracket) *bracket = '\0';
-      autoload_trim(p);
-      val_l = strtol(p, &endptr, 0);
-      if (endptr == p || val_l < 0 || val_l > 0xFF)
-         return false;
-      out_entry->is_const = false;
-      out_entry->is_auto  = false;
-      while (bracket)
-      {
-         bracket2 = strchr(bracket, '[');
-         if (!bracket2) break;
-         {
-            char *close = strchr(bracket2, ']');
-            char  flag[32];
-            size_t flen;
-            if (!close) break;
-            flen = close - bracket2 - 1;
-            if (flen >= sizeof(flag)) flen = sizeof(flag) - 1;
-            memcpy(flag, bracket2 + 1, flen);
-            flag[flen] = '\0';
-            if (AUTOLOAD_STRCASECMP(flag, "const") == 0)
-               out_entry->is_const = true;
-            else if (AUTOLOAD_STRCASECMP(flag, "auto") == 0)
-               out_entry->is_auto = true;
-            bracket = close + 1;
-         }
-      }
-   }
-
-   out_entry->addr = (uint32_t)addr_l;
-   out_entry->val  = (uint8_t)val_l;
-   return true;
-}
-
-static int cheats_load_for_rom(const char *rom_cfg_path)
-{
-   FILE *fp;
-   char  line[1024];
-   int   loaded = 0;
-
-   cheats_count = 0;
-   memset(cheats_list, 0, sizeof(cheats_list));
-
-   fp = fopen(rom_cfg_path, "r");
-   if (!fp)
-      return -1;
-
-   while (fgets(line, sizeof(line), fp))
-   {
-      cheat_entry e;
-      autoload_trim(line);
-      if (line[0] == '\0' || line[0] == '#' || line[0] == ';')
-         continue;
-      if (cheats_count >= CHEATS_MAX_ENTRIES)
-      {
-         autoload_logf("CHEATS        : max %d entries reached, ignoring rest",
-                       CHEATS_MAX_ENTRIES);
-         break;
-      }
-      if (cheats_parse_line(line, &e))
-      {
-         cheats_list[cheats_count++] = e;
-         loaded++;
-         autoload_logf("CHEATS        : loaded 0x%x = 0x%02x%s%s",
-                       (unsigned)e.addr, (unsigned)e.val,
-                       e.is_const ? " [const]" : "",
-                       e.is_auto  ? " [auto]"  : "");
-      }
-      else
-         autoload_logf("CHEATS        : skip malformed line: %s", line);
-   }
-
-   fclose(fp);
-   return loaded;
-}
-
-static void cheats_apply_const(void)
-{
-   int i;
-   uint8_t *ram = cheats_get_ram_ptr();
-   size_t   sz  = cheats_get_ram_size();
-   if (!ram || sz == 0)
-      return;
-   for (i = 0; i < cheats_count; i++)
-   {
-      if (cheats_list[i].is_const && cheats_list[i].addr < sz)
-         ram[cheats_list[i].addr] = cheats_list[i].val;
-   }
-}
-
-static void cheats_apply_oneshot(void)
-{
-   int i;
-   int applied = 0;
-   uint8_t *ram = cheats_get_ram_ptr();
-   size_t   sz  = cheats_get_ram_size();
-   if (!ram || sz == 0)
-   {
-      autoload_logf("CHEATS        : Num2 pressed but no System RAM available");
-      return;
-   }
-   for (i = 0; i < cheats_count; i++)
-   {
-      if (!cheats_list[i].is_const && cheats_list[i].addr < sz)
-      {
-         ram[cheats_list[i].addr] = cheats_list[i].val;
-         applied++;
-      }
-   }
-   autoload_logf("CHEATS        : Num2 pressed, applied %d oneshot cheats", applied);
-}
-
-static void cheats_apply_auto(void)
-{
-   int i;
-   int applied = 0;
-   uint8_t *ram = cheats_get_ram_ptr();
-   size_t   sz  = cheats_get_ram_size();
-   if (!ram || sz == 0)
-      return;
-   for (i = 0; i < cheats_count; i++)
-   {
-      if (cheats_list[i].is_auto && cheats_list[i].addr < sz)
-      {
-         ram[cheats_list[i].addr] = cheats_list[i].val;
-         applied++;
-      }
-   }
-   autoload_logf("CHEATS        : auto-applied %d [auto] cheat(s) on ROM load", applied);
-}
-
-static void cheats_maybe_reload(void)
-{
-   char core_cfg[AUTOLOAD_MAX_PATH];
-   char rom_cfg[AUTOLOAD_MAX_PATH];
-   int  loaded;
-
-   if (!cheats_pending_reload)
-      return;
-   cheats_pending_reload = false;
-
-   autoload_get_self_cfg(core_cfg, sizeof(core_cfg));
-   if (core_cfg[0] == '\0')
-   {
-      autoload_logf("CHEATS        : could not locate core .cfg, cheats disabled");
-      return;
-   }
-
-   cheats_read_paths_from_cfg(core_cfg);
-   if (cheats_paths_count == 0)
-   {
-      autoload_logf("CHEATS        : no 'cheats_path' in %s, cheats disabled", core_cfg);
-      return;
-   }
-
-   if (!cheats_find_rom_cfg(rom_cfg, sizeof(rom_cfg)))
-   {
-      autoload_logf("CHEATS        : no per-ROM .cfg found for '%s'",
-                    autoload_rom_path[0] ? autoload_rom_path : "(no rom)");
-      return;
-   }
-
-   loaded = cheats_load_for_rom(rom_cfg);
-   if (loaded < 0)
-   {
-      autoload_logf("CHEATS        : could not read %s", rom_cfg);
-      return;
-   }
-   autoload_logf("CHEATS        : %d cheat(s) loaded from %s", loaded, rom_cfg);
-
-   if (loaded > 0)
-      cheats_apply_auto();
-}
 
 void retro_run(void) 
 {
