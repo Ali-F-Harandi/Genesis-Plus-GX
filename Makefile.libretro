@@ -90,6 +90,12 @@ ifneq (,$(findstring unix,$(platform)))
    ENDIANNESS_DEFINES := -DLSB_FIRST -DBYTE_ORDER=LITTLE_ENDIAN
    PLATFORM_DEFINES := -DHAVE_ZLIB
    MAX_ROM_SIZE = 33554432
+   # [AUTOLOAD-PATCH] _GNU_SOURCE exposes Dl_info/dladdr() in <dlfcn.h>;
+   # -ldl links libdl which provides dladdr() at runtime. Both are needed
+   # for the auto-load save-state block in libretro.c to find the core's
+   # own .so path at runtime (dladdr on the function address).
+   CFLAGS += -D_GNU_SOURCE
+   LDFLAGS += -ldl
 
    ifneq ($(findstring Linux,$(shell uname -s)),)
      HAVE_CDROM = 1
